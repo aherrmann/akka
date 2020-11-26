@@ -37,6 +37,7 @@ object SupervisionSpec {
   sealed trait Command
   final case class Ping(n: Int) extends Command
   final case class Throw(e: Throwable) extends Command
+  final case class PipeThrow(e: Throwable) extends Command
   case object IncrementState extends Command
   case object GetState extends Command
   final case class CreateChild[T](behavior: Behavior[T], name: String) extends Command
@@ -76,8 +77,13 @@ object SupervisionSpec {
           Behaviors.same
         case Throw(e) =>
           throw e
+        case PipeThrow(e) =>
+          context.pipeToSelf(Future.successful(()))(_ => Throw(e))
+          Behaviors.same
       }
     }.receiveSignal {
+      case (_, MessageAdaptionFailure(e)) =>
+        throw e
       case (_, sig) =>
         if (sig == PostStop)
           slowStop.foreach(latch => latch.await(10, TimeUnit.SECONDS))
@@ -351,7 +357,7 @@ class SupervisionSpec extends ScalaTestWithActorTestKit("""
     "support nesting exceptions with different strategies" in {
       val probe = TestProbe[Event]("evt")
       val behv =
-        supervise(supervise(targetBehavior(probe.ref)).onFailure[RuntimeException](SupervisorStrategy.stop))
+        supervise(supervise(targetBehavior(probe.ref)).onFailure[IllegalArgumentException](SupervisorStrategy.stop))
           .onFailure[Exception](SupervisorStrategy.restart)
 
       val ref = spawn(behv)
@@ -364,6 +370,38 @@ class SupervisionSpec extends ScalaTestWithActorTestKit("""
       LoggingTestKit.error[IllegalArgumentException].expect {
         ref ! Throw(new IllegalArgumentException("cat"))
         probe.expectMessage(ReceivedSignal(PostStop))
+      }
+    }
+
+    "support nesting exceptions with different strategies with pipeToSelf" in {
+      val probe = TestProbe[Event]("evt")
+      val inner = Behaviors.setup[Command] { ctx =>
+        // FAILS with "expected ReceivedSignal(PostStop), found ReceivedSignal(PreRestart)"
+        ctx.pipeToSelf(Future.successful(()))(_ => Throw(new IllegalArgumentException("cat")))
+
+        targetBehavior(probe.ref)
+      }
+
+      val behv =
+        supervise(supervise(inner).onFailure[IllegalArgumentException](SupervisorStrategy.stop))
+          .onFailure[Exception](SupervisorStrategy.restart)
+
+      // SUCCEEDS
+      //val behv =
+      //  supervise(supervise(inner).onFailure[RuntimeException](SupervisorStrategy.stop))
+      //    .onFailure[Exception](SupervisorStrategy.restart)
+
+      val _ = spawn(behv)
+
+      LoggingTestKit.error[IllegalArgumentException].expect {
+
+        // FAILS with "expected ReceivedSignal(PostStop), found ReceivedSignal(PreRestart)"
+        //ref ! PipeThrow(new IllegalArgumentException("cat"))
+
+        // SUCCEEDS
+        //ref ! Throw(new IllegalArgumentException("cat"))
+
+        probe.expectMessage[Event](ReceivedSignal(PostStop))
       }
     }
 
